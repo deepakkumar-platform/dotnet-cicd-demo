@@ -9,6 +9,6 @@ public class PriceCalculator
         if (quantity < 0) throw new ArgumentOutOfRangeException(nameof(quantity));
 
         var total = unitPrice * quantity;
-        return quantity >= 10 ? total * 0.9m : total;
+        return quantity > 10 ? total * 0.9m : total;
     }
 }
