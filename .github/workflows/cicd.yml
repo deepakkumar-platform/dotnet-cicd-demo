@@ -63,7 +63,7 @@ jobs:
       port: ${{ steps.resolve.outputs.port }}
       health_url: ${{ steps.resolve.outputs.healthUrl }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: .github/config
 
@@ -91,7 +91,7 @@ jobs:
     env:
       GITLEAKS_VERSION: 8.30.1   # check github.com/gitleaks/gitleaks/releases for latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.BUILD_BRANCH }}
 
@@ -131,7 +131,7 @@ jobs:
 
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gitleaks-report
           path: gitleaks-report.json
@@ -151,12 +151,12 @@ jobs:
     steps:
       - run: git config --system core.longpaths true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.BUILD_BRANCH }}
           fetch-depth: 0   # full history gives Sonar better results
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
 
@@ -207,7 +207,7 @@ jobs:
 
       - name: Upload unit test results
         if: always() && env.TEST_PROJECT != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.Service }}_UnitTestResults
           path: TestResults/*.trx
@@ -251,7 +251,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.Service }}_Artifact
           path: publish
@@ -266,12 +266,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout deploy scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.Service }}_Artifact
           path: artifact
