@@ -8,8 +8,13 @@ DEPLOY_PATH="${DEPLOY_PATH/#\~/$HOME}"
 BACKUP_ROOT="${BACKUP_ROOT/#\~/$HOME}"
 PID_FILE="$DEPLOY_PATH/app.pid"
 
+# Prefer the user-installed .NET 8 in ~/.dotnet; the system dotnet may not have the 8.0 runtime
+if [ -x "$HOME/.dotnet/dotnet" ]; then
+  export DOTNET_ROOT="$HOME/.dotnet"
+fi
 DOTNET="${DOTNET_ROOT:-$HOME/.dotnet}/dotnet"
 [ -x "$DOTNET" ] || DOTNET="$(command -v dotnet)"
+echo "Using $DOTNET ($("$DOTNET" --list-runtimes | grep -c 'NETCore.App 8\.') .NET 8 runtime(s) found)"
 
 # 1. Stop the running app (like stopping the IIS app pool)
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
