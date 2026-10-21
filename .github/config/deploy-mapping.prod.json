@@ -1,0 +1,12 @@
+{
+  "Demo.Api": {
+    "projectPath": "src/Demo.Api/Demo.Api.csproj",
+    "testProjectPath": "tests/Demo.Api.Tests/Demo.Api.Tests.csproj",
+    "entryDll": "Demo.Api.dll",
+    "runnerLabel": "demo-runner",
+    "deployPath": "~/demo-deploy/prod/Demo.Api",
+    "backupRoot": "~/demo-deploy/backups/prod/Demo.Api",
+    "port": 5090,
+    "healthUrl": "http://localhost:5090/health"
+  }
+}

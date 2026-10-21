@@ -1,0 +1,46 @@
+name: PR Checks
+
+# Improvement #5: build, test and scan every pull request before it can be merged. Never deploys.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read   # PR checks only need to read code
+
+jobs:
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+      - name: Scan for secrets
+        run: ./gitleaks dir . --redact --exit-code 1
+
+  build-and-test:
+    name: build-and-test (${{ matrix.service }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One entry per service (copy paths from .github/config/deploy-mapping.qa.json)
+          - service: Demo.Api
+            project: src/Demo.Api/Demo.Api.csproj
+            tests: tests/Demo.Api.Tests/Demo.Api.Tests.csproj
+    steps:
+      - run: git config --system core.longpaths true
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build
+        run: dotnet build "${{ matrix.project }}" --configuration Release
+      - name: Unit tests
+        if: matrix.tests != ''
+        run: dotnet test "${{ matrix.tests }}" --configuration Release --logger "console;verbosity=normal"

@@ -1,0 +1,358 @@
+name: Demo Microservice CI/CD
+run-name: Deploy — ${{ github.actor }} — ${{ inputs.DeployEnvironment }} — ${{ inputs.Service }}
+
+# Small copy of the real "Microservices Windows CI/CD" pipeline, plus the 5 improvements:
+#   #1 Secret scanning (Gitleaks)          -> job: security-scan
+#   #2 Vulnerable NuGet package check      -> job: build, step "Check for vulnerable NuGet packages"
+#   #3 SonarQube + Quality Gate for prod   -> job: build, steps "Sonar ..."
+#   #4 Run summary + Teams notification    -> steps writing $GITHUB_STEP_SUMMARY, job: notify-teams
+#   #5 PR checks                           -> separate file: pr-checks.yml
+#
+# Real pipeline deploys to IIS on Windows; this demo deploys to a Linux self-hosted runner instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      DeployEnvironment:
+        type: choice
+        description: Selects .github/config/deploy-mapping.<env>.json
+        required: true
+        default: qa
+        options:
+          - qa
+          - prod
+      Service:
+        type: choice
+        description: Service key from the mapping JSON
+        required: true
+        default: Demo.Api
+        options:
+          - Demo.Api
+      branch:
+        type: string
+        description: 'Branch to build (empty = main)'
+        required: false
+        default: ''
+      SkipDeploy:
+        type: boolean
+        description: Build and upload artifact only (no deploy)
+        default: false
+      RunSonar:
+        type: boolean
+        description: Run SonarQube on non-prod (always runs for prod)
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  BUILD_BRANCH: ${{ inputs.branch || 'main' }}
+  IS_PROD: ${{ inputs.DeployEnvironment == 'prod' }}
+
+jobs:
+  resolve:
+    name: Resolve deploy mapping
+    runs-on: ubuntu-latest
+    outputs:
+      project_path: ${{ steps.resolve.outputs.projectPath }}
+      test_project_path: ${{ steps.resolve.outputs.testProjectPath }}
+      entry_dll: ${{ steps.resolve.outputs.entryDll }}
+      runner_label: ${{ steps.resolve.outputs.runnerLabel }}
+      deploy_path: ${{ steps.resolve.outputs.deployPath }}
+      backup_root: ${{ steps.resolve.outputs.backupRoot }}
+      port: ${{ steps.resolve.outputs.port }}
+      health_url: ${{ steps.resolve.outputs.healthUrl }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/config
+
+      - name: Read mapping for service
+        id: resolve
+        shell: bash
+        env:
+          SERVICE: ${{ inputs.Service }}
+          DEPLOY_ENV: ${{ inputs.DeployEnvironment }}
+        run: |
+          file=".github/config/deploy-mapping.${DEPLOY_ENV}.json"
+          [ -f "$file" ] || { echo "::error::Mapping file $file not found"; exit 1; }
+          svc=$(jq -c --arg s "$SERVICE" '.[$s] // empty' "$file")
+          [ -n "$svc" ] || { echo "::error::Service $SERVICE not found in $file"; exit 1; }
+          for k in projectPath testProjectPath entryDll runnerLabel deployPath backupRoot port healthUrl; do
+            echo "$k=$(jq -r --arg k "$k" '.[$k] // ""' <<<"$svc")" >> "$GITHUB_OUTPUT"
+          done
+          echo "Resolved $SERVICE from $file:"; jq . <<<"$svc"
+
+  # ---------- Improvement #1: secret scanning ----------
+  security-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    needs: resolve
+    env:
+      GITLEAKS_VERSION: 8.30.1   # check github.com/gitleaks/gitleaks/releases for latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_BRANCH }}
+
+      - name: Install Gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+
+      - name: Scan source for secrets
+        shell: bash
+        run: |
+          set +e
+          ./gitleaks dir . --redact --report-format json --report-path gitleaks-report.json --exit-code 1
+          rc=$?
+          set -e
+
+          count=$(jq length gitleaks-report.json 2>/dev/null || echo 0)
+          {
+            echo "### 🔐 Secret scan"
+            if [ "$count" -eq 0 ]; then
+              echo "✅ No secrets found"
+            else
+              echo "❌ **$count possible secret(s) found**"
+              echo ""
+              echo "| Rule | File | Line |"
+              echo "|---|---|---|"
+              jq -r '.[] | "| \(.RuleID) | \(.File) | \(.StartLine) |"' gitleaks-report.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Block prod, only warn on other environments
+          if [ "$rc" -ne 0 ]; then
+            if [ "$IS_PROD" = "true" ]; then
+              echo "::error::Secrets found. Prod deploy blocked."; exit 1
+            fi
+            echo "::warning::Secrets found. See run summary."
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  build:
+    name: Build, test, publish
+    runs-on: windows-latest
+    needs: [resolve, security-scan]
+    env:
+      PROJECT: ${{ needs.resolve.outputs.project_path }}
+      TEST_PROJECT: ${{ needs.resolve.outputs.test_project_path }}
+      # Improvement #3: Sonar always runs for prod
+      RUN_SONAR: ${{ (inputs.RunSonar || inputs.DeployEnvironment == 'prod') && 'true' || 'false' }}
+      SONAR_CONFIGURED: ${{ secrets.SONAR_TOKEN != '' && 'true' || 'false' }}
+    steps:
+      - run: git config --system core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_BRANCH }}
+          fetch-depth: 0   # full history gives Sonar better results
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # ---------- Improvement #2: vulnerable packages ----------
+      - name: Check for vulnerable NuGet packages
+        shell: pwsh
+        run: |
+          dotnet restore $env:PROJECT
+          if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed" }
+
+          $report = dotnet list $env:PROJECT package --vulnerable --include-transitive 2>&1 | Out-String
+          Write-Host $report
+
+          Add-Content $env:GITHUB_STEP_SUMMARY "### 📦 Vulnerable NuGet packages"
+          Add-Content $env:GITHUB_STEP_SUMMARY '```text'
+          Add-Content $env:GITHUB_STEP_SUMMARY $report
+          Add-Content $env:GITHUB_STEP_SUMMARY '```'
+
+          if ($report -match '\s(High|Critical)\s') {
+            if ($env:IS_PROD -eq 'true') { throw "High/Critical vulnerable packages found. Prod deploy blocked." }
+            Write-Host "::warning::High/Critical vulnerable packages found. See run summary."
+          }
+
+      - name: Run unit tests
+        if: env.TEST_PROJECT != ''
+        shell: pwsh
+        run: |
+          dotnet test $env:TEST_PROJECT --configuration Release `
+            --logger "console;verbosity=normal" `
+            --logger "trx;LogFileName=unit-tests.trx" `
+            --results-directory TestResults
+          if ($LASTEXITCODE -ne 0) { throw "Unit tests failed. Deploy blocked." }
+
+      # ---------- Improvement #4: results on the run summary ----------
+      - name: Unit test summary
+        if: always() && env.TEST_PROJECT != ''
+        shell: pwsh
+        run: |
+          $trx = Get-ChildItem -Path TestResults -Filter *.trx -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $trx) { Add-Content $env:GITHUB_STEP_SUMMARY "### 🧪 Unit tests`nNo results file found."; exit 0 }
+          [xml]$r = Get-Content -LiteralPath $trx.FullName
+          $c = $r.TestRun.ResultSummary.Counters
+          $icon = if ([int]$c.failed -gt 0) { '❌' } else { '✅' }
+          Add-Content $env:GITHUB_STEP_SUMMARY "### 🧪 Unit tests $icon"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| Total | Passed | Failed |"
+          Add-Content $env:GITHUB_STEP_SUMMARY "|---|---|---|"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| $($c.total) | $($c.passed) | $($c.failed) |"
+
+      - name: Upload unit test results
+        if: always() && env.TEST_PROJECT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.Service }}_UnitTestResults
+          path: TestResults/*.trx
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # ---------- Improvement #3: Sonar with Quality Gate ----------
+      - name: Sonar not configured
+        if: env.RUN_SONAR == 'true' && env.SONAR_CONFIGURED != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "::warning::SONAR_TOKEN secret not set. Skipping Sonar (the real pipeline would block prod here)."
+          Add-Content $env:GITHUB_STEP_SUMMARY "### 📊 SonarQube`n⚠️ Skipped: SONAR_TOKEN not configured"
+
+      - name: Install Sonar scanner
+        if: env.RUN_SONAR == 'true' && env.SONAR_CONFIGURED == 'true'
+        shell: pwsh
+        run: dotnet tool install dotnet-sonarscanner --tool-path .sonar/scanner
+
+      - name: Sonar analysis + Quality Gate
+        if: env.RUN_SONAR == 'true' && env.SONAR_CONFIGURED == 'true'
+        shell: pwsh
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonarcloud.io' }}
+          SONAR_ORG: ${{ vars.SONAR_ORGANIZATION }}
+          SONAR_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+        run: |
+          .\.sonar\scanner\dotnet-sonarscanner begin /k:"$env:SONAR_KEY" /o:"$env:SONAR_ORG" /d:sonar.host.url="$env:SONAR_HOST_URL" /d:sonar.token="$env:SONAR_TOKEN" /d:sonar.qualitygate.wait=true
+          dotnet build $env:PROJECT --configuration Release
+          .\.sonar\scanner\dotnet-sonarscanner end /d:sonar.token="$env:SONAR_TOKEN"
+          $rc = $LASTEXITCODE
+          $status = if ($rc -eq 0) { '✅ Quality Gate passed' } else { '❌ Quality Gate failed' }
+          Add-Content $env:GITHUB_STEP_SUMMARY "### 📊 SonarQube`n$status"
+          if ($rc -ne 0) { throw "SonarQube Quality Gate failed. See Sonar dashboard." }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          dotnet publish $env:PROJECT --configuration Release --output publish
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.Service }}_Artifact
+          path: publish
+          retention-days: 2
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to server
+    runs-on: [self-hosted, "${{ needs.resolve.outputs.runner_label }}"]
+    needs: [resolve, build]
+    if: ${{ !inputs.SkipDeploy }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout deploy scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.Service }}_Artifact
+          path: artifact
+
+      - name: Deploy
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ github.workspace }}/artifact
+          DEPLOY_PATH: ${{ needs.resolve.outputs.deploy_path }}
+          BACKUP_ROOT: ${{ needs.resolve.outputs.backup_root }}
+          ENTRY_DLL: ${{ needs.resolve.outputs.entry_dll }}
+          PORT: ${{ needs.resolve.outputs.port }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: .github/scripts/deploy-linux.sh
+
+      # Extra (not in the top 5): prove the app actually started
+      - name: Health check
+        shell: bash
+        env:
+          HEALTH_URL: ${{ needs.resolve.outputs.health_url }}
+          DEPLOY_PATH: ${{ needs.resolve.outputs.deploy_path }}
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS "$HEALTH_URL"; then
+              echo; echo "Healthy after $i attempt(s)"; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Health check failed: $HEALTH_URL"
+          tail -n 50 "${DEPLOY_PATH/#\~/$HOME}/app.log" || true
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        env:
+          SERVICE: ${{ inputs.Service }}
+          DEPLOY_ENV: ${{ inputs.DeployEnvironment }}
+          HEALTH_URL: ${{ needs.resolve.outputs.health_url }}
+          STATUS: ${{ job.status }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo "### 🚀 Deployment"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Service | $SERVICE |"
+            echo "| Environment | $DEPLOY_ENV |"
+            echo "| Build branch | $BUILD_BRANCH |"
+            echo "| Health URL | $HEALTH_URL |"
+            echo "| Status | $STATUS |"
+            echo "| Triggered by | $ACTOR |"
+            echo "| Run | #$GITHUB_RUN_NUMBER |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- Improvement #4: Teams notification ----------
+  # The real pipeline would notify on prod only; the demo notifies on every run.
+  notify-teams:
+    name: Notify Teams
+    runs-on: ubuntu-latest
+    needs: [security-scan, build, deploy]
+    if: always()
+    steps:
+      - name: Post result to Teams
+        shell: bash
+        env:
+          WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          SERVICE: ${{ inputs.Service }}
+          DEPLOY_ENV: ${{ inputs.DeployEnvironment }}
+          ACTOR: ${{ github.actor }}
+          SCAN: ${{ needs.security-scan.result }}
+          BUILD: ${{ needs.build.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          text="**$SERVICE** → **$DEPLOY_ENV** by $ACTOR | Scan: $SCAN | Build: $BUILD | Deploy: $DEPLOY | [Open run]($RUN_URL)"
+          if [ -z "$WEBHOOK" ]; then
+            echo "::notice::TEAMS_WEBHOOK_URL not set. Message would be: $text"
+            echo "### 📣 Teams: not configured. Message would be: $text" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          jq -n --arg t "$text" '{type:"message",attachments:[{contentType:"application/vnd.microsoft.card.adaptive",content:{type:"AdaptiveCard",version:"1.4",body:[{type:"TextBlock",text:$t,wrap:true}]}}]}' \
+            | curl -sS -f -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK"
+          echo "### 📣 Teams: notification sent" >> "$GITHUB_STEP_SUMMARY"
