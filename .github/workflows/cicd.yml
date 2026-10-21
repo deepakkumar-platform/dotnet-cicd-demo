@@ -1,5 +1,5 @@
 name: Demo Microservice CI/CD
-run-name: Deploy — ${{ github.actor }} — ${{ inputs.DeployEnvironment }} — ${{ inputs.Service }}
+run-name: Deploy — ${{ inputs.Service }} — ${{ inputs.DeployEnvironment }} — ${{ inputs.branch || 'main' }} — by ${{ github.actor }}
 
 # Small copy of the real "Microservices Windows CI/CD" pipeline, plus the 5 improvements:
 #   #1 Secret scanning (Gitleaks)          -> job: security-scan
